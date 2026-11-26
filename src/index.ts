@@ -196,7 +196,13 @@ export default function piRioExtension(pi: ExtensionAPI) {
 	>();
 	const turnFileNotes = new Map<number, { changeNote?: string; fileChanges?: FileChangeNote[] }>();
 
+	// Pi invalidates a ctx after shutdown, reload, or session replacement; every getter then throws.
+	// Async sidecar work must never touch a captured ctx after an await. Live-feed identity is
+	// captured synchronously while the ctx is still valid, and all late UI work goes through safeUi().
 	let lastCtx: ExtensionContext | null = null;
+	let disposed = false;
+	let liveSessionId: string | null = null;
+	let liveCwd: string | null = null;
 	let activeAbort: AbortController | null = null;
 	let inFlight = false;
 	const pendingQueue: TurnDelta[] = [];
@@ -239,13 +245,31 @@ export default function piRioExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
-	function syncLive(ctx?: ExtensionContext, alive = true): void {
-		const targetCtx = ctx ?? lastCtx;
-		if (!targetCtx) return;
-		const sessionId = targetCtx.sessionManager.getSessionId() || `pid-${process.pid}`;
+	/** Capture live-feed identity while ctx is guaranteed valid (synchronously inside an event handler). */
+	function bindSession(ctx: ExtensionContext): void {
+		try {
+			liveSessionId = ctx.sessionManager.getSessionId() || `pid-${process.pid}`;
+			liveCwd = ctx.cwd;
+		} catch {
+			// ctx already stale; keep the previous identity
+		}
+	}
+
+	/** Run a ctx/UI operation, swallowing stale-ctx errors raised after shutdown or reload. */
+	function safeUi(fn: () => void): void {
+		if (disposed) return;
+		try {
+			fn();
+		} catch {
+			// ctx went stale between scheduling and running; drop this UI update
+		}
+	}
+
+	function syncLive(alive = true): void {
+		if (!liveSessionId || !liveCwd) return;
 		publishLiveSession({
-			sessionId,
-			cwd: targetCtx.cwd,
+			sessionId: liveSessionId,
+			cwd: liveCwd,
 			alive,
 			detail: config.detail,
 			language: currentResolvedLang(),
@@ -255,11 +279,17 @@ export default function piRioExtension(pi: ExtensionAPI) {
 	}
 
 	function refreshUi(ctx?: ExtensionContext, skipLive = false): void {
-		const targetCtx = ctx ?? lastCtx ?? undefined;
+		if (disposed) return;
 		if (!skipLive) {
-			syncLive(targetCtx, true);
+			syncLive(true);
 		}
-		if (!targetCtx || !targetCtx.hasUI) return;
+		const targetCtx = ctx ?? lastCtx ?? undefined;
+		if (!targetCtx) return;
+		safeUi(() => renderUi(targetCtx));
+	}
+
+	function renderUi(targetCtx: ExtensionContext): void {
+		if (!targetCtx.hasUI) return;
 
 		if (!shouldShowWidget()) {
 			if (widgetMounted) {
@@ -340,18 +370,35 @@ export default function piRioExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		void drainSidecar(delta, ctx, runGeneration);
+		// Capture registry + fallback model now, while ctx is valid. Never read ctx after an await.
+		let modelRegistry: ExtensionContext["modelRegistry"];
+		let fallbackModel: ExtensionContext["model"];
+		try {
+			modelRegistry = ctx.modelRegistry;
+			fallbackModel = ctx.model;
+		} catch {
+			return;
+		}
+
+		void drainSidecar(delta, modelRegistry, fallbackModel, runGeneration).catch(() => {
+			// Last-resort guard: a background sidecar failure must never crash the Pi process.
+		});
 	}
 
-	async function drainSidecar(firstDelta: TurnDelta, ctx: ExtensionContext, generation: number): Promise<void> {
+	async function drainSidecar(
+		firstDelta: TurnDelta,
+		modelRegistry: ExtensionContext["modelRegistry"],
+		fallbackModel: ExtensionContext["model"],
+		generation: number,
+	): Promise<void> {
 		let next: TurnDelta | null = firstDelta;
 		inFlight = true;
 		state.isAnalyzing = true;
 		syncSpinner();
-		refreshUi(ctx);
+		refreshUi();
 
 		try {
-			while (next && generation === runGeneration && config.enabled) {
+			while (next && !disposed && generation === runGeneration && config.enabled) {
 				const delta = next;
 				next = null;
 
@@ -360,15 +407,15 @@ export default function piRioExtension(pi: ExtensionAPI) {
 
 				try {
 					const result = await runSidecarAnalysis(
-						ctx.modelRegistry,
+						modelRegistry,
 						config,
 						state,
 						delta,
 						controller.signal,
-						ctx.model,
+						fallbackModel,
 					);
 
-					if (generation !== runGeneration) break;
+					if (disposed || generation !== runGeneration) break;
 
 					stats.calls += 1;
 					stats.inputTokens += result.inputTokens;
@@ -388,14 +435,14 @@ export default function piRioExtension(pi: ExtensionAPI) {
 						});
 					}
 					persistSnapshot();
-					refreshUi(ctx);
+					refreshUi();
 				} catch (err) {
-					if (controller.signal.aborted || generation !== runGeneration) {
+					if (disposed || controller.signal.aborted || generation !== runGeneration) {
 						break;
 					}
 					stats.failures += 1;
 					stats.lastError = err instanceof Error ? cleanText(err.message, 100) : String(err);
-					refreshUi(ctx);
+					refreshUi();
 				} finally {
 					if (activeAbort === controller) {
 						activeAbort = null;
@@ -410,7 +457,7 @@ export default function piRioExtension(pi: ExtensionAPI) {
 			inFlight = false;
 			state.isAnalyzing = false;
 			syncSpinner();
-			refreshUi(ctx);
+			refreshUi();
 		}
 	}
 
@@ -451,7 +498,9 @@ export default function piRioExtension(pi: ExtensionAPI) {
 	// ---- Lifecycle Hooks ----
 
 	pi.on("session_start", (_event, ctx) => {
+		disposed = false;
 		lastCtx = ctx;
+		bindSession(ctx);
 		config = loadConfig();
 		const resolved = resolveSidecarModel(ctx.modelRegistry, config, ctx.model);
 		stats.activeModelLabel = resolved ? `${resolved.provider}/${resolved.id}` : formatConfiguredModel(config);
@@ -470,12 +519,17 @@ export default function piRioExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		// Bump generation so any in-flight drain loop exits without touching UI.
+		runGeneration += 1;
 		cancelInFlight();
 		stopSpinner();
-		syncLive(ctx, false);
-		if (ctx.hasUI && widgetMounted) {
-			ctx.ui.setWidget(WIDGET_KEY, undefined);
-		}
+		syncLive(false);
+		safeUi(() => {
+			if (ctx.hasUI && widgetMounted) {
+				ctx.ui.setWidget(WIDGET_KEY, undefined);
+			}
+		});
+		disposed = true;
 		widgetMounted = false;
 		widgetRequestRender = null;
 		activeOverlay = null;
@@ -484,6 +538,7 @@ export default function piRioExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event, ctx) => {
 		lastCtx = ctx;
+		bindSession(ctx);
 		if (!config.enabled) return;
 		if (event.messageType !== "user") return;
 
